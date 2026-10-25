@@ -20,7 +20,11 @@ client = AzureOpenAI(
     azure_endpoint=AZURE_OPENAI_ENDPOINT
 )
 
-# --- Document Loading (Pure Python) ---
+# --- File Paths ---
+DATA_FILE = 'scraped_data.jsonl'
+VECTOR_DB_FILE = 'vector_db.json'
+
+# --- Helper Functions ---
 def load_docs_from_jsonl(file_path):
     """Loads document records as standard dictionaries from a jsonl file."""
     array = []
@@ -37,33 +41,59 @@ def clean_text(text):
     import re
     return re.sub(r'\s+', ' ', text).strip()
 
-# --- Load Vector Database into Pandas DataFrame ---
-DATA_FILE = 'scraped_data.jsonl'
-raw_docs = load_docs_from_jsonl(DATA_FILE)
-
-# Build DataFrame using native dictionaries
-df_data = []
-for doc in raw_docs:
-    metadata = doc.get("metadata", {})
-    df_data.append({
-        "title": metadata.get("title", "No Title"),
-        "source": metadata.get("source", ""),
-        "content": clean_text(doc.get("page_content", ""))
-    })
-
-df = pd.DataFrame(df_data)
-
 def get_embedding(text):
+    """Generates an embedding vector using Azure OpenAI."""
     response = client.embeddings.create(
         input=[text],
         model=AZURE_EMBEDDING_DEPLOYMENT
     )
     return response.data[0].embedding
 
-# Precompute embeddings for the DataFrame if not already present
-if not df.empty and 'embedding' not in df.columns:
-    print("Computing embeddings for dataframe items...")
-    df['embedding'] = df['content'].apply(lambda x: get_embedding(x[:2000]))
+# --- Vector Database Initialization & Persistence Logic ---
+def initialize_vector_db():
+    """Loads precomputed vector database from disk if available. 
+    Otherwise, computes embeddings from scraped_data.jsonl and saves them.
+    """
+    if os.path.exists(VECTOR_DB_FILE):
+        print(f"Loading vector database from {VECTOR_DB_FILE}...")
+        with open(VECTOR_DB_FILE, 'r', encoding='utf-8') as f:
+            df_data = json.load(f)
+        return pd.DataFrame(df_data)
+    
+    print(f"Vector database '{VECTOR_DB_FILE}' not found.")
+    raw_docs = load_docs_from_jsonl(DATA_FILE)
+    if not raw_docs:
+        print("Warning: Source data file is empty or missing.")
+        return pd.DataFrame(columns=["title", "source", "content", "embedding"])
+
+    print("Computing embeddings from scratch (this may take a moment)...")
+    df_data = []
+    for doc in raw_docs:
+        metadata = doc.get("metadata", {})
+        title = metadata.get("title", "No Title")
+        source = metadata.get("source", "")
+        content = clean_text(doc.get("page_content", ""))
+        
+        print(f"Processing: {title}")
+        # Generate embedding (limiting input chunk size for safety)
+        embedding = get_embedding(content[:2000])
+        
+        df_data.append({
+            "title": title,
+            "source": source,
+            "content": content,
+            "embedding": embedding
+        })
+    
+    # Save to disk as a JSON file vector database
+    with open(VECTOR_DB_FILE, 'w', encoding='utf-8') as f:
+        json.dump(df_data, f, ensure_ascii=False, indent=2)
+    print(f"Vector database successfully created and saved to {VECTOR_DB_FILE}")
+
+    return pd.DataFrame(df_data)
+
+# Load database into memory on startup
+df = initialize_vector_db()
 
 def retrieve_top_k(query, k=3):
     """Retrieves top-k relevant articles using sklearn cosine similarity."""
@@ -95,7 +125,7 @@ def home():
 def ask():
     user_query = request.json.get("query", "")
     if not user_query:
-        return jsonify({"error": "No query provided"}), 400
+        return jsonify({"error": "No query provided"}, 400)
 
     # 1. Retrieve relevant context from Pandas Vector DB
     retrieved_docs = retrieve_top_k(user_query, k=3)
