@@ -5,15 +5,13 @@ import pandas as pd
 from flask import Flask, render_template, request, jsonify
 from sklearn.metrics.pairwise import cosine_similarity
 from openai import AzureOpenAI
-from langchain.schema import Document
 
 app = Flask(__name__)
 
 # --- Configuration & Azure Clients ---
-# Ensure you have set these environment variables in your Azure deployment environment
 AZURE_OPENAI_API_KEY = os.environ.get("AZURE_OPENAI_API_KEY", "your-azure-api-key")
 AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT", "https://your-resource-name.openai.azure.com/")
-AZURE_DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o") # Your model deployment name in Azure Foundry
+AZURE_DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o")
 AZURE_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
 
 client = AzureOpenAI(
@@ -22,21 +20,20 @@ client = AzureOpenAI(
     azure_endpoint=AZURE_OPENAI_ENDPOINT
 )
 
-# --- Reused Functions from Notebook[cite: 1] ---
+# --- Document Loading (Pure Python) ---
 def load_docs_from_jsonl(file_path):
-    """Loads langchain Documents from a jsonl file (reused from notebook)[cite: 1]."""
+    """Loads document records as standard dictionaries from a jsonl file."""
     array = []
     if not os.path.exists(file_path):
         return array
     with open(file_path, 'r', encoding='utf-8') as jsonl_file:
         for line in jsonl_file:
             data = json.loads(line)
-            obj = Document(**data)
-            array.append(obj)
+            array.append(data)
     return array
 
 def clean_text(text):
-    """Cleans input text by removing extra whitespaces[cite: 1]."""
+    """Cleans input text by removing extra whitespaces."""
     import re
     return re.sub(r'\s+', ' ', text).strip()
 
@@ -44,20 +41,18 @@ def clean_text(text):
 DATA_FILE = 'scraped_data.jsonl'
 raw_docs = load_docs_from_jsonl(DATA_FILE)
 
-# Build DataFrame and precompute or load embeddings
+# Build DataFrame using native dictionaries
 df_data = []
 for doc in raw_docs:
+    metadata = doc.get("metadata", {})
     df_data.append({
-        "title": doc.metadata.get("title", "No Title"),
-        "source": doc.metadata.get("source", ""),
-        "content": clean_text(doc.page_content)
+        "title": metadata.get("title", "No Title"),
+        "source": metadata.get("source", ""),
+        "content": clean_text(doc.get("page_content", ""))
     })
 
 df = pd.DataFrame(df_data)
 
-# NOTE: In production, pre-compute and store embeddings in your JSONL file. 
-# For this basic setup, you can generate dummy embeddings or compute them on startup if dataset is small.
-# Here we simulate or generate embeddings if an embedding column is missing:
 def get_embedding(text):
     response = client.embeddings.create(
         input=[text],
@@ -68,17 +63,14 @@ def get_embedding(text):
 # Precompute embeddings for the DataFrame if not already present
 if not df.empty and 'embedding' not in df.columns:
     print("Computing embeddings for dataframe items...")
-    # Limiting to content slice for speed in a basic app demo
     df['embedding'] = df['content'].apply(lambda x: get_embedding(x[:2000]))
 
 def retrieve_top_k(query, k=3):
-    """Retrieves top-k relevant articles using sklearn cosine similarity[cite: 1]."""
+    """Retrieves top-k relevant articles using sklearn cosine similarity."""
     if df.empty or 'embedding' not in df.columns:
         return []
     
     query_embedding = get_embedding(query)
-    
-    # Compute similarity against all rows using sklearn
     doc_embeddings = np.vstack(df['embedding'].values)
     similarities = cosine_similarity([query_embedding], doc_embeddings)[0]
     
@@ -89,7 +81,7 @@ def retrieve_top_k(query, k=3):
         results.append({
             "title": df.iloc[idx]['title'],
             "source": df.iloc[idx]['source'],
-            "content": df.iloc[idx]['content'][:1000], # Snippet preview
+            "content": df.iloc[idx]['content'][:1000],
             "score": float(similarities[idx])
         })
     return results
@@ -107,10 +99,9 @@ def ask():
 
     # 1. Retrieve relevant context from Pandas Vector DB
     retrieved_docs = retrieve_top_k(user_query, k=3)
-    
     context_text = "\n\n".join([f"Source: {doc['source']}\nContent: {doc['content']}" for doc in retrieved_docs])
 
-    # 2. Generate answer using Azure Foundry Model (Azure OpenAI)
+    # 2. Generate answer using Azure Foundry Model
     prompt = f"""You are a helpful assistant. Use the following context pieces to answer the user's question accurately. If you don't know the answer based on the context, state that you don't know.
 
 Context:
